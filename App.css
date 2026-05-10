@@ -1,0 +1,1786 @@
+import React, { useMemo, useRef, useState } from "react";
+
+const INSPECTORS = ["", "越智誉", "大野", "安部", "奥", "大谷", "越智幸", "その他"];
+const SHIP_TYPES = ["", "22CHE", "26CHE", "33CHE", "35CHE", "20BC", "40BC", "58BC", "61BC", "64BC", "11カーゴ", "PCC", "DFPCC", "RORO", "セメント", "石灰石", "その他"];
+const VENDORS = ["", "来島テック", "コマツ", "四国ビジネス", "因島鉄工", "宇品どっく", "三和工業", "野澤工業", "本工", "その他"];
+
+function todayString() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function signedMm(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  if (value === 0) return "0 mm";
+  return `${value > 0 ? "+" : ""}${value} mm`;
+}
+
+function numOrNull(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function onlyDigits(value) {
+  return String(value || "")
+    .split("")
+    .map((ch) => {
+      const code = ch.charCodeAt(0);
+      if (code >= 65296 && code <= 65305) return String(code - 65296);
+      return ch;
+    })
+    .filter((ch) => ch >= "0" && ch <= "9")
+    .join("");
+}
+
+function nextId(points) {
+  let max = 0;
+  points.forEach((p) => {
+    const s = String(p.id || "");
+    if (s.startsWith("P")) {
+      const n = Number(s.slice(1));
+      if (Number.isFinite(n)) max = Math.max(max, n);
+    }
+  });
+  return `P${max + 1}`;
+}
+
+function pointNumber(pointId) {
+  const n = Number(String(pointId || "").replace("P", ""));
+  return Number.isFinite(n) ? n : pointId;
+}
+
+function safeFileName(text) {
+  let result = String(text || "block");
+  ["/", ":", "*", "?", "<", ">", "|", " ", "　"].forEach((c) => {
+    result = result.split(c).join("_");
+  });
+  return result || "block";
+}
+
+function downloadText(filename, text, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function autoLabelOffset(index) {
+  const positions = [
+    { dx: 18, dy: -26 },
+    { dx: 40, dy: -10 },
+    { dx: 18, dy: 18 },
+    { dx: -70, dy: -26 },
+    { dx: -88, dy: -10 },
+    { dx: -70, dy: 18 },
+    { dx: 18, dy: -46 },
+    { dx: -70, dy: 38 }
+  ];
+  return positions[index % positions.length];
+}
+
+function calcLevelDiff(point, basePoint, settings) {
+  if (!point || !basePoint) return null;
+  if (point.height === null || point.height === undefined) return null;
+  if (basePoint.height === null || basePoint.height === undefined) return null;
+
+  const rawDiff = point.height - basePoint.height;
+  const direction = settings.instrumentPosition === "above" ? -1 : 1;
+  let levelDiff = rawDiff * direction;
+
+  const pointThickness = numOrNull(point.thickness) ?? 0;
+  const baseThickness = numOrNull(basePoint.thickness) ?? 0;
+  const thicknessDiff = pointThickness - baseThickness;
+
+  if (settings.thicknessMode === "variable" && settings.instrumentPosition === "below" && settings.referenceSurface === "upper") {
+    levelDiff += thicknessDiff;
+  }
+
+  if (settings.thicknessMode === "variable" && settings.instrumentPosition === "above" && settings.referenceSurface === "lower") {
+    levelDiff -= thicknessDiff;
+  }
+
+  if (settings.useCamber) {
+    const pointCamber = numOrNull(point.camber) ?? 0;
+    const baseCamber = numOrNull(basePoint.camber) ?? 0;
+    levelDiff -= pointCamber - baseCamber;
+  }
+
+  return Math.round(levelDiff * 10) / 10;
+}
+
+function calculationPatternLabel(settings) {
+  const pos = settings.instrumentPosition === "below" ? "ブロック下から計測" : "ブロック上から計測";
+  const ref = settings.referenceSurface === "upper" ? "鉄板上面基準" : "鉄板下面基準";
+  const thick = settings.thicknessMode === "variable" ? `板厚バラバラ${settings.defaultThickness !== null && settings.defaultThickness !== undefined ? `（初期 ${settings.defaultThickness} mm）` : ""}` : "板厚同一";
+  return `${pos} / ${ref} / ${thick}${settings.useCamber ? " / キャンバー修正あり" : " / キャンバー修正なし"}`;
+}
+
+function calculateTwistFromSelected(selectedPoints) {
+  if (selectedPoints.length !== 4) return null;
+  if (selectedPoints.some((p) => p.diff === null || p.diff === undefined)) return null;
+  const [a, b, c, d] = selectedPoints;
+  const diagA = a.diff + c.diff;
+  const diagB = b.diff + d.diff;
+  return {
+    diagA,
+    diagB,
+    twist: Math.abs(diagA - diagB),
+    diagAFormula: `${a.id}(${signedMm(a.diff)}) + ${c.id}(${signedMm(c.diff)})`,
+    diagBFormula: `${b.id}(${signedMm(b.diff)}) + ${d.id}(${signedMm(d.diff)})`
+  };
+}
+
+function runSelfTests() {
+  const errors = [];
+  if (signedMm(3) !== "+3 mm") errors.push("signedMm positive failed");
+  if (signedMm(-2) !== "-2 mm") errors.push("signedMm negative failed");
+  if (signedMm(0) !== "0 mm") errors.push("signedMm zero failed");
+  if (onlyDigits("A12B345") !== "12345") errors.push("onlyDigits failed");
+  if (onlyDigits("１２３４") !== "1234") errors.push("onlyDigits full-width failed");
+  if (nextId([{ id: "P1" }, { id: "P7" }]) !== "P8") errors.push("nextId failed");
+  const case1 = calcLevelDiff({ height: 90, thickness: 20 }, { height: 100, thickness: 10 }, { instrumentPosition: "below", referenceSurface: "upper", thicknessMode: "variable", useCamber: false });
+  if (case1 !== 0) errors.push("calcLevelDiff case1 failed");
+  const case5 = calcLevelDiff({ height: 90, thickness: null }, { height: 100, thickness: null }, { instrumentPosition: "above", referenceSurface: "lower", thicknessMode: "same", useCamber: false });
+  if (case5 !== 10) errors.push("calcLevelDiff case5 failed");
+  const camber = calcLevelDiff({ height: 500, thickness: null, camber: -100 }, { height: 500, thickness: null, camber: 0 }, { instrumentPosition: "below", referenceSurface: "upper", thicknessMode: "same", useCamber: true });
+  if (camber !== 100) errors.push("calcLevelDiff camber failed");
+  const twist = calculateTwistFromSelected([
+    { id: "P1", diff: 0 },
+    { id: "P2", diff: 1 },
+    { id: "P3", diff: 3 },
+    { id: "P4", diff: -1 }
+  ]);
+  if (!twist || twist.twist !== 3) errors.push("calculateTwistFromSelected failed");
+  if (errors.length > 0) console.warn("Self test warnings:", errors);
+}
+
+runSelfTests();
+
+const css = `
+* { box-sizing: border-box; }
+body { margin: 0; background: #f4f7fb; color: #0f172a; font-family: system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; }
+.app { min-height: 100vh; padding: 16px; }
+.shell { max-width: 1280px; margin: 0 auto; display: grid; gap: 16px; }
+.card { background: white; border-radius: 24px; padding: 20px; box-shadow: 0 6px 24px rgba(15,23,42,.08); }
+.centerCard { max-width: 920px; margin: 24px auto; }
+.title { margin: 0 0 6px; font-size: 28px; font-weight: 900; }
+.subtitle { margin: 0 0 20px; color: #64748b; font-size: 14px; line-height: 1.6; }
+.formGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.formGrid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.formBlock { border-radius: 18px; padding: 14px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.full { grid-column: 1 / -1; }
+.label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 800; color: #475569; }
+.input, .select { width: 100%; border: 1px solid #cbd5e1; border-radius: 14px; padding: 11px 12px; font-size: 14px; outline: none; background: white; }
+.input:focus, .select:focus { border-color: #334155; box-shadow: 0 0 0 3px rgba(51,65,85,.12); }
+.btnRow { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.btn { border: 1px solid #cbd5e1; background: white; color: #0f172a; border-radius: 14px; padding: 10px 14px; font-size: 14px; font-weight: 800; cursor: pointer; }
+.btn:hover { background: #f8fafc; }
+.btn.primary { background: #0f172a; color: white; border-color: #0f172a; }
+.btn.blue { background: #2563eb; color: white; border-color: #2563eb; }
+.btn.green { background: #059669; color: white; border-color: #059669; }
+.btn.red { color: #dc2626; border-color: #fecaca; }
+.btn.stepNow { background: #059669; color: white; border-color: #059669; box-shadow: 0 0 0 4px rgba(5,150,105,.14); }
+.btn.stepDone { background: #dcfce7; color: #166534; border-color: #86efac; }
+.btn.stepWaiting { background: white; color: #64748b; border-color: #cbd5e1; }
+.btn:disabled { opacity: .75; cursor: not-allowed; }
+.fileBox { border: 2px dashed #cbd5e1; border-radius: 20px; padding: 24px; text-align: center; background: #f8fafc; }
+.previewImg { display: block; width: 100%; max-height: 420px; object-fit: contain; background: white; margin-top: 16px; border: 1px solid #e2e8f0; border-radius: 18px; }
+.cameraBox { margin-top: 16px; padding: 12px; border-radius: 18px; background: white; border: 1px solid #e2e8f0; }
+.cameraVideo { display: block; width: 100%; max-height: 420px; object-fit: contain; background: #0f172a; border-radius: 18px; }
+.mainGrid { display: grid; grid-template-columns: minmax(0, 1.45fr) 420px; gap: 16px; align-items: start; }
+.drawingHeader { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.sectionTitle { margin: 0 0 4px; font-size: 20px; font-weight: 900; }
+.infoText { color: #64748b; font-size: 13px; margin: 0; line-height: 1.5; }
+.canvasWrap { position: relative; min-height: 680px; background: white; border: 1px dashed #94a3b8; border-radius: 24px; overflow: hidden; }
+.canvasImage { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: white; }
+.canvasHint { position: absolute; top: 12px; left: 12px; z-index: 6; background: rgba(255,255,255,.95); border: 1px solid #e2e8f0; border-radius: 14px; padding: 8px 10px; font-size: 12px; font-weight: 900; box-shadow: 0 6px 16px rgba(15,23,42,.08); }
+.pointPin { position: absolute; width: 18px; height: 18px; border-radius: 999px; transform: translate(-50%, -50%); border: 2px solid white; background: #dc2626; color: white; box-shadow: 0 2px 8px rgba(15,23,42,.28); cursor: pointer; z-index: 7; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 950; line-height: 1; }
+.pointPin.base { background: #059669; }
+.pointPin.pendingBase { background: #f59e0b; }
+.pointPin.twist { background: #2563eb; }
+.pointPin.editing { background: #dc2626; outline: 3px solid rgba(220,38,38,.18); }
+.pointLabelCard { position: absolute; min-width: 52px; max-width: 92px; background: rgba(255,255,255,.98); border: 1px solid #cbd5e1; border-radius: 10px; padding: 4px 6px; box-shadow: 0 4px 12px rgba(15,23,42,.14); z-index: 8; cursor: grab; user-select: none; touch-action: none; }
+.pointLabelCard.dragging { cursor: grabbing; box-shadow: 0 10px 24px rgba(15,23,42,.24); border-color: #2563eb; }
+.pointLabelId { font-size: 9px; font-weight: 900; color: #0f172a; line-height: 1.15; margin-bottom: 1px; }
+.pointLabelValue { font-size: 9px; font-weight: 800; color: #334155; line-height: 1.15; white-space: nowrap; }
+.overlaySwitch { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px; border-radius: 16px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.overlaySwitchLabel { font-size: 12px; font-weight: 900; color: #475569; }
+.sideCol { display: grid; gap: 16px; }
+.panel { background: white; border-radius: 24px; padding: 16px; box-shadow: 0 6px 24px rgba(15,23,42,.08); }
+.panelTitle { margin: 0 0 10px; font-size: 18px; font-weight: 900; }
+.muted { font-size: 13px; color: #64748b; line-height: 1.6; }
+.smallBox { border-radius: 16px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; margin-bottom: 12px; }
+.confirmBox { border-radius: 18px; padding: 14px; background: #fffbeb; border: 1px solid #fde68a; color: #92400e; margin-bottom: 12px; }
+.measureList { display: grid; gap: 8px; max-height: 320px; overflow: auto; margin-top: 10px; }
+.measureRow { display: grid; grid-template-columns: 54px 1fr 88px; gap: 8px; align-items: center; border: 1px solid #e2e8f0; border-radius: 16px; padding: 8px; }
+.measureBadge { border: 0; background: #f1f5f9; border-radius: 12px; padding: 9px 6px; font-weight: 900; cursor: pointer; }
+.diffText { text-align: right; font-size: 13px; font-weight: 900; }
+.diffUp { color: #dc2626; }
+.diffDown { color: #2563eb; }
+.resultBox { border-radius: 20px; padding: 16px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.resultBox.ok { color: #065f46; background: #ecfdf5; border-color: #a7f3d0; }
+.resultBox.ng { color: #92400e; background: #fffbeb; border-color: #fde68a; }
+.resultValue { font-size: 34px; font-weight: 950; margin: 4px 0 10px; }
+.empty { padding: 14px; border-radius: 16px; background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; font-size: 13px; font-weight: 800; }
+.success { padding: 14px; border-radius: 16px; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; font-size: 13px; font-weight: 800; }
+.registerActionBox { position: sticky; bottom: 12px; z-index: 20; margin-top: 18px; padding: 14px; border-radius: 20px; background: rgba(255,255,255,.96); border: 1px solid #e2e8f0; box-shadow: 0 10px 28px rgba(15,23,42,.14); }
+.btn.bigNext { width: 100%; justify-content: center; font-size: 16px; padding: 14px 18px; background: #0f172a; color: white; border-color: #0f172a; }
+.choiceGroup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.choiceBtn { border: 2px solid #cbd5e1; background: white; color: #334155; border-radius: 18px; padding: 16px 12px; text-align: center; cursor: pointer; font-weight: 900; font-size: 14px; line-height: 1.4; box-shadow: 0 4px 12px rgba(15,23,42,.05); }
+.choiceBtn:hover { background: #f8fafc; }
+.choiceBtn.active { background: #2563eb; color: white; border-color: #2563eb; box-shadow: 0 0 0 4px rgba(37,99,235,.16), 0 10px 22px rgba(37,99,235,.22); }
+.choiceSub { display: block; margin-top: 4px; font-size: 11px; font-weight: 700; opacity: .82; }
+.pageBackBar { margin-bottom: 12px; }
+.btn.backBtn { background: #f8fafc; border-color: #cbd5e1; color: #334155; }
+.textarea { width: 100%; min-height: 130px; resize: vertical; border: 1px solid #cbd5e1; border-radius: 14px; padding: 11px 12px; font-size: 14px; line-height: 1.6; outline: none; background: white; font-family: inherit; }
+.textarea:focus { border-color: #334155; box-shadow: 0 0 0 3px rgba(51,65,85,.12); }
+.savedBanner { padding: 12px 14px; border-radius: 16px; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; font-size: 13px; font-weight: 900; }
+.lockedText { font-size: 12px; color: #64748b; font-weight: 800; margin-top: 8px; }
+.topBottomCard { position: absolute; z-index: 9; transform: translate(-8px, -8px); width: 132px; background: rgba(255,255,255,.98); border: 1px solid #93c5fd; border-radius: 12px; padding: 6px; box-shadow: 0 8px 20px rgba(15,23,42,.14); cursor: grab; touch-action: none; }
+.topBottomRow { display: grid; grid-template-columns: 42px 1fr; gap: 4px; align-items: center; margin-bottom: 4px; }
+.topBottomRow:last-child { margin-bottom: 0; }
+.topBottomLabel { font-size: 10px; font-weight: 950; color: #1d4ed8; white-space: nowrap; }
+.topBottomCard.dragging { border-color: #2563eb; box-shadow: 0 12px 26px rgba(37,99,235,.24); cursor: grabbing; }
+.topBottomInput { width: 100%; border: 1px solid #bfdbfe; border-radius: 8px; padding: 4px 5px; font-size: 11px; outline: none; }
+.topBottomInput:focus { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,.12); }
+.topBottomNote { display: none; }
+@media (max-width: 1024px) { .mainGrid { grid-template-columns: 1fr; } .canvasWrap { min-height: 520px; } }
+@media (max-width: 760px) { .formGrid, .formGrid.three { grid-template-columns: 1fr; } .centerCard { margin: 8px auto; } }
+`;
+
+const initialInspectionInfo = () => ({
+  measurementDate: todayString(),
+  inspectors: ["", "", ""],
+  inspectorOthers: ["", "", ""],
+  sno: "",
+  shipType: "",
+  shipTypeOther: "",
+  vendor: "",
+  vendorOther: "",
+  blockName: ""
+});
+
+const initialCalcSettings = () => ({
+  instrumentPosition: "below",
+  referenceSurface: "upper",
+  thicknessMode: "same",
+  defaultThickness: null,
+  useCamber: false
+});
+
+export default function App() {
+  const [screen, setScreen] = useState("home");
+  const [homeMode, setHomeMode] = useState(null);
+  const [inspectionInfo, setInspectionInfo] = useState(initialInspectionInfo);
+  const [calcSettings, setCalcSettings] = useState(initialCalcSettings);
+  const [drawingImage, setDrawingImage] = useState(null);
+  const [cameraStream, setCameraStream] = useState(null);
+  const [cameraError, setCameraError] = useState("");
+  const [points, setPoints] = useState([]);
+  const [editingPointId, setEditingPointId] = useState(null);
+  const [draftHeight, setDraftHeight] = useState("");
+  const [mode, setMode] = useState("topBottom");
+  const [basePointId, setBasePointId] = useState(null);
+  const [pendingBaseId, setPendingBaseId] = useState(null);
+  const [selectedTwistIds, setSelectedTwistIds] = useState([]);
+  const [twistResult, setTwistResult] = useState(null);
+  const [threshold, setThreshold] = useState(15);
+  const [inspectorOptions, setInspectorOptions] = useState(INSPECTORS);
+  const [shipTypeOptions, setShipTypeOptions] = useState(SHIP_TYPES);
+  const [vendorOptions, setVendorOptions] = useState(VENDORS);
+  const [listEditor, setListEditor] = useState({ type: null, value: "" });
+  const [deleteEditor, setDeleteEditor] = useState({ type: null, value: "" });
+  const [overlayMode, setOverlayMode] = useState("point");
+  const [draggingLabelId, setDraggingLabelId] = useState(null);
+  const [draggingTopBottomId, setDraggingTopBottomId] = useState(null);
+  const [pointInputLocked, setPointInputLocked] = useState(false);
+  const [topBottomMarks, setTopBottomMarks] = useState([]);
+  const [isRecordSaved, setIsRecordSaved] = useState(false);
+  const [freeComment, setFreeComment] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null);
+  const dragRef = useRef({ pointId: null, startX: 0, startY: 0, originDx: 0, originDy: 0, moved: false });
+  const topBottomDragRef = useRef({ markId: null, startX: 0, startY: 0, originX: 0, originY: 0, moved: false });
+
+  const displayShipType = inspectionInfo.shipType === "その他" ? inspectionInfo.shipTypeOther : inspectionInfo.shipType;
+  const displayVendor = inspectionInfo.vendor === "その他" ? inspectionInfo.vendorOther : inspectionInfo.vendor;
+  const displayInspectors = inspectionInfo.inspectors
+    .map((name, index) => (name === "その他" ? inspectionInfo.inspectorOthers[index] : name))
+    .filter(Boolean);
+  const blockCode = `${displayShipType || "船種未設定"}-${inspectionInfo.sno || "SNo未入力"}`;
+
+  const basePoint = useMemo(() => points.find((p) => p.id === basePointId) || null, [points, basePointId]);
+
+  const pointsWithDiff = useMemo(() => {
+    return points.map((p) => ({
+      ...p,
+      diff: basePoint ? calcLevelDiff(p, basePoint, calcSettings) : null
+    }));
+  }, [points, basePoint, calcSettings]);
+
+  const editingPoint = pointsWithDiff.find((p) => p.id === editingPointId) || null;
+  const pendingBasePoint = pointsWithDiff.find((p) => p.id === pendingBaseId) || null;
+
+  const stepState = {
+    topBottom: mode === "topBottom" ? "now" : "done",
+    pointInput: pointInputLocked ? "done" : mode === "point" ? "now" : "waiting",
+    pointFinish: pointInputLocked ? (mode === "point" && !basePointId && !twistResult ? "now" : "done") : "waiting",
+    baseSelect: basePointId ? "done" : mode === "baseSelect" ? "now" : pointInputLocked ? "waiting" : "waiting",
+    twistSelect: twistResult ? "done" : mode === "twistSelect" ? "now" : basePointId ? "waiting" : "waiting",
+    saveOutput: isRecordSaved ? "done" : twistResult ? "now" : "waiting"
+  };
+
+  function stepClass(stepName) {
+    if (stepState[stepName] === "now") return "btn stepNow";
+    if (stepState[stepName] === "done") return "btn stepDone";
+    return "btn stepWaiting";
+  }
+
+  function updateInfo(key, value) {
+    setInspectionInfo((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function updateCalcSetting(key, value) {
+    if (isRecordSaved) return;
+    setCalcSettings((prev) => ({ ...prev, [key]: value }));
+    setTwistResult(null);
+  }
+
+  function updateDefaultThickness(value) {
+    if (isRecordSaved) return;
+    const n = numOrNull(value);
+    setCalcSettings((prev) => ({ ...prev, defaultThickness: n }));
+    setTwistResult(null);
+  }
+
+  function openListEditor(type) {
+    setListEditor({ type, value: "" });
+  }
+
+  function cancelListEditor() {
+    setListEditor({ type: null, value: "" });
+  }
+
+  function openDeleteEditor(type) {
+    setDeleteEditor({ type, value: "" });
+  }
+
+  function cancelDeleteEditor() {
+    setDeleteEditor({ type: null, value: "" });
+  }
+
+  function removableOptions(type) {
+    if (type === "inspector") return inspectorOptions.filter((item) => item && item !== "その他");
+    if (type === "shipType") return shipTypeOptions.filter((item) => item && item !== "その他");
+    if (type === "vendor") return vendorOptions.filter((item) => item && item !== "その他");
+    return [];
+  }
+
+  function deleteDropdownOption() {
+    const value = deleteEditor.value;
+    if (!value) {
+      alert("削除する項目を選択してください。");
+      return;
+    }
+
+    if (deleteEditor.type === "inspector") {
+      setInspectorOptions((prev) => prev.filter((item) => item !== value));
+      setInspectionInfo((prev) => ({
+        ...prev,
+        inspectors: prev.inspectors.map((name) => (name === value ? "" : name))
+      }));
+    }
+
+    if (deleteEditor.type === "shipType") {
+      setShipTypeOptions((prev) => prev.filter((item) => item !== value));
+      if (inspectionInfo.shipType === value) updateInfo("shipType", "");
+    }
+
+    if (deleteEditor.type === "vendor") {
+      setVendorOptions((prev) => prev.filter((item) => item !== value));
+      if (inspectionInfo.vendor === value) updateInfo("vendor", "");
+    }
+
+    setDeleteEditor({ type: null, value: "" });
+  }
+
+  function addDropdownOption() {
+    const value = String(listEditor.value || "").trim();
+    if (!value) {
+      alert("追加する名前を入力してください。");
+      return;
+    }
+
+    if (listEditor.type === "inspector") {
+      setInspectorOptions((prev) => {
+        if (prev.includes(value)) return prev;
+        const base = prev.filter((item) => item !== "その他");
+        return [...base, value, "その他"];
+      });
+    }
+
+    if (listEditor.type === "shipType") {
+      setShipTypeOptions((prev) => {
+        if (prev.includes(value)) return prev;
+        const base = prev.filter((item) => item !== "その他");
+        return [...base, value, "その他"];
+      });
+      updateInfo("shipType", value);
+      updateInfo("shipTypeOther", "");
+    }
+
+    if (listEditor.type === "vendor") {
+      setVendorOptions((prev) => {
+        if (prev.includes(value)) return prev;
+        const base = prev.filter((item) => item !== "その他");
+        return [...base, value, "その他"];
+      });
+      updateInfo("vendor", value);
+      updateInfo("vendorOther", "");
+    }
+
+    setListEditor({ type: null, value: "" });
+  }
+
+  function updateInspector(index, value) {
+    setInspectionInfo((prev) => {
+      const next = [...prev.inspectors];
+      const otherNext = [...prev.inspectorOthers];
+      next[index] = value;
+      if (value !== "その他") otherNext[index] = "";
+      return { ...prev, inspectors: next, inspectorOthers: otherNext };
+    });
+  }
+
+  function updateInspectorOther(index, value) {
+    setInspectionInfo((prev) => {
+      const next = [...prev.inspectorOthers];
+      next[index] = value;
+      return { ...prev, inspectorOthers: next };
+    });
+  }
+
+  function registerInspectionInfo() {
+    if (!inspectionInfo.measurementDate) {
+      alert("測定日を選択してください。");
+      return;
+    }
+    setScreen("upload");
+  }
+
+  function uploadDrawing(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => setDrawingImage(String(e.target.result || ""));
+    reader.readAsDataURL(file);
+  }
+
+  async function startCamera() {
+    setCameraError("");
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setCameraError("この環境ではカメラ起動に対応していません。画像を選択して登録してください。");
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+      setCameraStream(stream);
+    } catch (error) {
+      setCameraError("カメラを起動できませんでした。ブラウザのカメラ許可を確認してください。");
+    }
+  }
+
+  function stopCamera() {
+    if (cameraStream) cameraStream.getTracks().forEach((track) => track.stop());
+    setCameraStream(null);
+  }
+
+  function attachCamera(node) {
+    if (!node || !cameraStream) return;
+    node.srcObject = cameraStream;
+  }
+
+  function captureCameraImage() {
+    const video = document.getElementById("camera-preview-video");
+    if (!video) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setDrawingImage(canvas.toDataURL("image/jpeg", 0.92));
+    stopCamera();
+  }
+
+  function goInspect() {
+    if (!drawingImage) {
+      alert("図面画像を登録してください。");
+      return;
+    }
+    stopCamera();
+    setScreen("calcSettings");
+  }
+
+  function proceedToInspect() {
+    setScreen("inspect");
+  }
+
+  function goBackOnePage() {
+    if (screen === "upload") {
+      stopCamera();
+      setScreen("register");
+      return;
+    }
+    if (screen === "calcSettings") {
+      setScreen("upload");
+      return;
+    }
+    if (screen === "inspect") {
+      setScreen("calcSettings");
+    }
+  }
+
+  function resetAll() {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+    setScreen("home");
+    setHomeMode(null);
+    setInspectionInfo(initialInspectionInfo());
+    setCalcSettings(initialCalcSettings());
+    setDrawingImage(null);
+    stopCamera();
+    setPoints([]);
+    setEditingPointId(null);
+    setDraftHeight("");
+    setMode("topBottom");
+    setBasePointId(null);
+    setPendingBaseId(null);
+    setSelectedTwistIds([]);
+    setTwistResult(null);
+    setThreshold(15);
+    setInspectorOptions(INSPECTORS);
+    setShipTypeOptions(SHIP_TYPES);
+    setVendorOptions(VENDORS);
+    setListEditor({ type: null, value: "" });
+    setDeleteEditor({ type: null, value: "" });
+    setOverlayMode("point");
+    setDraggingLabelId(null);
+    setDraggingTopBottomId(null);
+    setPointInputLocked(false);
+    setTopBottomMarks([]);
+    setIsRecordSaved(false);
+    setFreeComment("");
+    setIsListening(false);
+    recognitionRef.current = null;
+    dragRef.current = { pointId: null, startX: 0, startY: 0, originDx: 0, originDy: 0, moved: false };
+    topBottomDragRef.current = { markId: null, startX: 0, startY: 0, originX: 0, originY: 0, moved: false };
+  }
+
+  function canvasClick(event) {
+    if (isRecordSaved) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * 100;
+    const y = ((event.clientY - rect.top) / rect.height) * 100;
+
+    if (mode === "topBottom") {
+      if (topBottomMarks.length >= 2) {
+        alert("TTop/Bottom入力は2個までです。");
+        return;
+      }
+      const id = `TB${topBottomMarks.length + 1}`;
+      setTopBottomMarks((prev) => [
+        ...prev,
+        {
+          id,
+          x: Math.round(x * 10) / 10,
+          y: Math.round(y * 10) / 10,
+          topText: "",
+          bottomText: ""
+        }
+      ]);
+      return;
+    }
+
+    if (mode !== "point") return;
+    if (pointInputLocked) return;
+
+    const id = nextId(points);
+    const seed = points.length;
+    const offset = autoLabelOffset(seed);
+    setPoints((prev) => [
+      ...prev,
+      {
+        id,
+        x: Math.round(x * 10) / 10,
+        y: Math.round(y * 10) / 10,
+        height: null,
+        thickness: calcSettings.thicknessMode === "variable" ? calcSettings.defaultThickness : null,
+        camber: 0,
+        labelDx: offset.dx,
+        labelDy: offset.dy,
+        labelMoved: false
+      }
+    ]);
+    setEditingPointId(id);
+    setDraftHeight("");
+    setTwistResult(null);
+  }
+
+  function updateTopBottomMark(markId, field, value) {
+    if (isRecordSaved) return;
+    setTopBottomMarks((prev) => prev.map((m) => (m.id === markId ? { ...m, [field]: value } : m)));
+  }
+
+  function deleteTopBottomMark(markId) {
+    if (isRecordSaved) return;
+    setTopBottomMarks((prev) => prev.filter((m) => m.id !== markId));
+  }
+
+  function startTopBottomDrag(event, markId) {
+    if (isRecordSaved) return;
+    const mark = topBottomMarks.find((m) => m.id === markId);
+    if (!mark) return;
+    topBottomDragRef.current = {
+      markId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: mark.x,
+      originY: mark.y,
+      moved: false
+    };
+    setDraggingTopBottomId(markId);
+  }
+
+  function moveTopBottomDrag(event, markId) {
+    const drag = topBottomDragRef.current;
+    if (drag.markId !== markId) return;
+    const wrap = event.currentTarget.parentElement;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const dxPercent = ((event.clientX - drag.startX) / rect.width) * 100;
+    const dyPercent = ((event.clientY - drag.startY) / rect.height) * 100;
+    if (Math.abs(event.clientX - drag.startX) > 3 || Math.abs(event.clientY - drag.startY) > 3) {
+      topBottomDragRef.current.moved = true;
+    }
+    setTopBottomMarks((prev) => prev.map((m) => (
+      m.id === markId
+        ? { ...m, x: Math.max(0, Math.min(100, Math.round((drag.originX + dxPercent) * 10) / 10)), y: Math.max(0, Math.min(100, Math.round((drag.originY + dyPercent) * 10) / 10)) }
+        : m
+    )));
+  }
+
+  function endTopBottomDrag() {
+    topBottomDragRef.current = { markId: null, startX: 0, startY: 0, originX: 0, originY: 0, moved: false };
+    setDraggingTopBottomId(null);
+  }
+
+  function startNewRecord() {
+    setHomeMode(null);
+    setScreen("register");
+  }
+
+  function buildJsonSaveData() {
+    return {
+      appName: "ship-block-measurement-dx-prototype",
+      version: 1,
+      savedAt: new Date().toISOString(),
+      inspectionInfo,
+      calcSettings,
+      drawingImage,
+      points,
+      topBottomMarks,
+      basePointId,
+      selectedTwistIds,
+      twistResult,
+      threshold,
+      overlayMode,
+      pointInputLocked,
+      isRecordSaved,
+      freeComment,
+      inspectorOptions,
+      shipTypeOptions,
+      vendorOptions
+    };
+  }
+
+  function exportJsonSave() {
+    const json = JSON.stringify(buildJsonSaveData(), null, 2);
+    const filename = `${safeFileName(blockCode)}_temporary_save.json`;
+    downloadText(filename, json, "application/json;charset=utf-8");
+    alert(`一時保存データをJSON形式で出力しました。\nファイル名: ${filename}`);
+  }
+
+  function importJsonSave(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(String(e.target.result || "{}"));
+        if (data.appName !== "ship-block-measurement-dx-prototype") {
+          alert("このアプリの保存データではない可能性があります。JSONファイルを確認してください。");
+          return;
+        }
+        setInspectionInfo(data.inspectionInfo || initialInspectionInfo());
+        setCalcSettings(data.calcSettings || initialCalcSettings());
+        setDrawingImage(data.drawingImage || null);
+        setPoints(Array.isArray(data.points) ? data.points : []);
+        setTopBottomMarks(Array.isArray(data.topBottomMarks) ? data.topBottomMarks : []);
+        setBasePointId(data.basePointId || null);
+        setPendingBaseId(null);
+        setSelectedTwistIds(Array.isArray(data.selectedTwistIds) ? data.selectedTwistIds : []);
+        setTwistResult(data.twistResult || null);
+        setThreshold(data.threshold ?? 15);
+        setOverlayMode(data.overlayMode || "point");
+        setPointInputLocked(Boolean(data.pointInputLocked));
+        setIsRecordSaved(Boolean(data.isRecordSaved));
+        setFreeComment(data.freeComment || "");
+        setInspectorOptions(Array.isArray(data.inspectorOptions) ? data.inspectorOptions : INSPECTORS);
+        setShipTypeOptions(Array.isArray(data.shipTypeOptions) ? data.shipTypeOptions : SHIP_TYPES);
+        setVendorOptions(Array.isArray(data.vendorOptions) ? data.vendorOptions : VENDORS);
+        setEditingPointId(null);
+        setDraftHeight("");
+        setMode(data.isRecordSaved ? "point" : data.pointInputLocked ? "point" : "topBottom");
+        setHomeMode(null);
+        setScreen(data.drawingImage ? "inspect" : "register");
+      } catch (error) {
+        alert("JSONファイルを読み込めませんでした。保存データの形式を確認してください。");
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = "";
+  }
+
+  function buildAnalysisExportData() {
+    const measuredPoints = pointsWithDiff.filter((p) => p.height !== null && p.height !== undefined);
+    const validDiffs = pointsWithDiff.map((p) => numOrNull(p.diff)).filter((v) => v !== null);
+    const absDiffs = validDiffs.map((v) => Math.abs(v));
+    const maxAbsDiff = absDiffs.length ? Math.max(...absDiffs) : null;
+    const avgAbsDiff = absDiffs.length ? Math.round((absDiffs.reduce((sum, v) => sum + v, 0) / absDiffs.length) * 10) / 10 : null;
+    const minDiff = validDiffs.length ? Math.min(...validDiffs) : null;
+    const maxDiff = validDiffs.length ? Math.max(...validDiffs) : null;
+    const measurementId = `${safeFileName(blockCode)}_${inspectionInfo.measurementDate || todayString()}`;
+
+    return {
+      exportPurpose: "database_and_statistical_analysis",
+      measurementId,
+      exportedAt: new Date().toISOString(),
+      inspection: {
+        measurementDate: inspectionInfo.measurementDate,
+        inspectors: displayInspectors,
+        sno: inspectionInfo.sno,
+        shipType: displayShipType,
+        vendor: displayVendor,
+        blockName: inspectionInfo.blockName,
+        blockCode
+      },
+      calculationSettings: {
+        instrumentPosition: calcSettings.instrumentPosition,
+        referenceSurface: calcSettings.referenceSurface,
+        thicknessMode: calcSettings.thicknessMode,
+        defaultThickness: calcSettings.defaultThickness,
+        useCamber: calcSettings.useCamber,
+        label: calculationPatternLabel(calcSettings)
+      },
+      summary: {
+        totalPoints: pointsWithDiff.length,
+        measuredPoints: measuredPoints.length,
+        basePointId,
+        thresholdMm: threshold,
+        minCalculatedDiffMm: minDiff,
+        maxCalculatedDiffMm: maxDiff,
+        maxAbsCalculatedDiffMm: maxAbsDiff,
+        avgAbsCalculatedDiffMm: avgAbsDiff,
+        twistMm: twistResult ? twistResult.twist : null,
+        twistJudgement: twistResult ? (twistResult.ok ? "OK" : "要精査") : "未計算",
+        twistDiagA: twistResult ? twistResult.diagA : null,
+        twistDiagB: twistResult ? twistResult.diagB : null
+      },
+      topBottomRecords: topBottomMarks.map((m) => ({
+        id: m.id,
+        xPercent: m.x,
+        yPercent: m.y,
+        tTop: m.topText,
+        bottom: m.bottomText
+      })),
+      measurementPoints: pointsWithDiff.map((p) => ({
+        measurementId,
+        pointId: p.id,
+        pointNo: pointNumber(p.id),
+        xPercent: p.x,
+        yPercent: p.y,
+        measuredHeightMm: p.height,
+        thicknessMm: p.thickness,
+        camberCorrectionMm: p.camber ?? 0,
+        calculatedDiffFromBaseMm: p.diff,
+        isBasePoint: p.id === basePointId,
+        usedForTwist: twistResult ? twistResult.ids.includes(p.id) : false
+      })),
+      twistResult: twistResult || null,
+      freeComment,
+      finalized: isRecordSaved
+    };
+  }
+
+  function csvCell(value) {
+    if (value === null || value === undefined) return "";
+    const text = String(value).replace(/"/g, '""');
+    if (text.includes(",") || text.includes("\n") || text.includes("\r") || text.includes('"')) {
+      return `"${text}"`;
+    }
+    return text;
+  }
+
+  function exportCsvForDatabase() {
+    const data = buildAnalysisExportData();
+    const headers = [
+      "measurementId", "measurementDate", "shipType", "sno", "vendor", "blockName", "blockCode", "inspectors",
+      "instrumentPosition", "referenceSurface", "thicknessMode", "useCamber", "basePointId", "thresholdMm",
+      "twistMm", "twistJudgement", "maxAbsCalculatedDiffMm", "avgAbsCalculatedDiffMm",
+      "pointId", "pointNo", "xPercent", "yPercent", "measuredHeightMm", "thicknessMm", "camberCorrectionMm", "calculatedDiffFromBaseMm", "isBasePoint", "usedForTwist", "freeComment"
+    ];
+    const rows = data.measurementPoints.length ? data.measurementPoints : [{ pointId: "", pointNo: "" }];
+    const csvRows = [headers.join(",")];
+    rows.forEach((p) => {
+      const row = [
+        data.measurementId,
+        data.inspection.measurementDate,
+        data.inspection.shipType,
+        data.inspection.sno,
+        data.inspection.vendor,
+        data.inspection.blockName,
+        data.inspection.blockCode,
+        data.inspection.inspectors.join(" / "),
+        data.calculationSettings.instrumentPosition,
+        data.calculationSettings.referenceSurface,
+        data.calculationSettings.thicknessMode,
+        data.calculationSettings.useCamber,
+        data.summary.basePointId,
+        data.summary.thresholdMm,
+        data.summary.twistMm,
+        data.summary.twistJudgement,
+        data.summary.maxAbsCalculatedDiffMm,
+        data.summary.avgAbsCalculatedDiffMm,
+        p.pointId,
+        p.pointNo,
+        p.xPercent,
+        p.yPercent,
+        p.measuredHeightMm,
+        p.thicknessMm,
+        p.camberCorrectionMm,
+        p.calculatedDiffFromBaseMm,
+        p.isBasePoint,
+        p.usedForTwist,
+        data.freeComment
+      ];
+      csvRows.push(row.map(csvCell).join(","));
+    });
+    downloadText(`${safeFileName(blockCode)}_database_points.csv`, "\uFEFF" + csvRows.join("\n"), "text/csv;charset=utf-8");
+  }
+
+  function exportJsonForDatabase() {
+    const json = JSON.stringify(buildAnalysisExportData(), null, 2);
+    downloadText(`${safeFileName(blockCode)}_database_record.json`, json, "application/json;charset=utf-8");
+  }
+
+  function htmlEscape(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function exportPdfReport() {
+    const data = buildAnalysisExportData();
+    const rows = data.measurementPoints.map((p) => (
+      `<tr><td>${htmlEscape(p.pointId)}</td><td>${htmlEscape(p.measuredHeightMm ?? "")}</td><td>${htmlEscape(p.thicknessMm ?? "")}</td><td>${htmlEscape(p.camberCorrectionMm ?? "")}</td><td>${htmlEscape(p.calculatedDiffFromBaseMm ?? "")}</td><td>${p.isBasePoint ? "○" : ""}</td><td>${p.usedForTwist ? "○" : ""}</td></tr>`
+    )).join("");
+    const topBottomHtml = topBottomMarks.length
+      ? topBottomMarks.map((m) => `${htmlEscape(m.id)}: TTop ${htmlEscape(m.topText || "—")} / Bottom ${htmlEscape(m.bottomText || "—")}`).join("<br>")
+      : "未入力";
+    const commentHtml = htmlEscape(freeComment || "未入力").replace(/\n/g, "<br>");
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>${htmlEscape(blockCode)} PDF出力</title><style>body{font-family:system-ui,sans-serif;padding:24px;color:#111827}h1{font-size:22px}table{border-collapse:collapse;width:100%;margin-top:12px}th,td{border:1px solid #d1d5db;padding:6px;font-size:12px}th{background:#f3f4f6}.box{border:1px solid #d1d5db;border-radius:10px;padding:12px;margin:10px 0}.small{font-size:12px;color:#4b5563;line-height:1.6}@media print{button{display:none}}</style></head><body><button onclick="window.print()" style="padding:10px 14px;font-weight:700">PDFとして保存 / 印刷</button><h1>船体ブロック 精度検査記録</h1><div class="box"><b>管理番号:</b> ${htmlEscape(blockCode)}<br><b>測定日:</b> ${htmlEscape(inspectionInfo.measurementDate)}<br><b>船種:</b> ${htmlEscape(displayShipType || "未設定")}<br><b>SNo:</b> ${htmlEscape(inspectionInfo.sno || "未入力")}<br><b>製造者/業者名:</b> ${htmlEscape(displayVendor || "未設定")}<br><b>ブロック名:</b> ${htmlEscape(inspectionInfo.blockName || "未設定")}<br><b>計測者:</b> ${htmlEscape(displayInspectors.join("、") || "未設定")}</div><div class="box"><b>計算条件:</b> ${htmlEscape(calculationPatternLabel(calcSettings))}<br><b>基準点:</b> ${htmlEscape(basePointId || "未設定")}<br><b>ねじれ量:</b> ${htmlEscape(data.summary.twistMm ?? "未計算")} mm<br><b>判定:</b> ${htmlEscape(data.summary.twistJudgement)}<br><b>最大絶対高低差:</b> ${htmlEscape(data.summary.maxAbsCalculatedDiffMm ?? "")} mm<br><b>平均絶対高低差:</b> ${htmlEscape(data.summary.avgAbsCalculatedDiffMm ?? "")} mm</div><h2>測定点一覧</h2><table><thead><tr><th>点</th><th>測定値mm</th><th>板厚mm</th><th>キャンバーmm</th><th>計算後高低差mm</th><th>基準点</th><th>4点指定</th></tr></thead><tbody>${rows || "<tr><td colspan='7'>未入力</td></tr>"}</tbody></table><h2>TTop / Bottom</h2><div class="small">${topBottomHtml}</div><h2>コメント</h2><div class="small">${commentHtml}</div></body></html>`;
+    const win = window.open("", "_blank");
+    if (!win) {
+      alert("PDF出力用の画面を開けませんでした。ブラウザのポップアップ許可を確認してください。");
+      return;
+    }
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+  }
+
+  function exportImageReport() {
+    if (!drawingImage) {
+      alert("図面画像がありません。");
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1600;
+      canvas.height = 1100;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const margin = 40;
+      const drawW = canvas.width - margin * 2;
+      const drawH = canvas.height - 190;
+      const scale = Math.min(drawW / img.width, drawH / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      const ox = margin + (drawW - w) / 2;
+      const oy = 120 + (drawH - h) / 2;
+      ctx.fillStyle = "#0f172a";
+      ctx.font = "bold 26px sans-serif";
+      ctx.fillText(`船体ブロック精度測定 ${blockCode}`, margin, 42);
+      ctx.font = "18px sans-serif";
+      ctx.fillText(`測定日: ${inspectionInfo.measurementDate || ""}  船種: ${displayShipType || ""}  SNo: ${inspectionInfo.sno || ""}`, margin, 74);
+      ctx.fillText(`ねじれ量: ${twistResult ? `${twistResult.twist} mm / ${twistResult.ok ? "OK" : "要精査"}` : "未計算"}`, margin, 102);
+      ctx.drawImage(img, ox, oy, w, h);
+      topBottomMarks.forEach((m) => {
+        const x = ox + (m.x / 100) * w;
+        const y = oy + (m.y / 100) * h;
+        ctx.fillStyle = "rgba(255,255,255,.9)";
+        ctx.strokeStyle = "#2563eb";
+        ctx.lineWidth = 2;
+        ctx.fillRect(x, y, 150, 44);
+        ctx.strokeRect(x, y, 150, 44);
+        ctx.fillStyle = "#1d4ed8";
+        ctx.font = "bold 15px sans-serif";
+        ctx.fillText(`TTop ${m.topText || ""}`, x + 8, y + 18);
+        ctx.fillText(`Bottom ${m.bottomText || ""}`, x + 8, y + 36);
+      });
+      pointsWithDiff.forEach((p) => {
+        const x = ox + (p.x / 100) * w;
+        const y = oy + (p.y / 100) * h;
+        ctx.beginPath();
+        ctx.arc(x, y, 11, 0, Math.PI * 2);
+        ctx.fillStyle = p.id === basePointId ? "#059669" : twistResult && twistResult.ids.includes(p.id) ? "#2563eb" : "#dc2626";
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(pointNumber(p.id)), x, y + 1);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = "rgba(255,255,255,.92)";
+        ctx.fillRect(x + 14, y - 18, 86, 30);
+        ctx.strokeStyle = "#cbd5e1";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 14, y - 18, 86, 30);
+        ctx.fillStyle = "#0f172a";
+        ctx.font = "bold 12px sans-serif";
+        ctx.fillText(`${p.id} ${pointDisplayText(p)}`, x + 20, y + 1);
+      });
+      const a = document.createElement("a");
+      a.href = canvas.toDataURL("image/png");
+      a.download = `${safeFileName(blockCode)}_annotated_image.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+    img.src = drawingImage;
+  }
+
+  function pointDisplayText(p) {
+    if (basePointId && p.diff !== null && p.diff !== undefined) return signedMm(p.diff);
+    if (p.height !== null && p.height !== undefined) return `${p.height} mm`;
+    return "未入力";
+  }
+
+  function startLabelDrag(event, pointId) {
+    const target = points.find((p) => p.id === pointId);
+    if (!target) return;
+    dragRef.current = {
+      pointId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originDx: target.labelDx ?? 18,
+      originDy: target.labelDy ?? -18,
+      moved: false
+    };
+    setDraggingLabelId(pointId);
+  }
+
+  function moveLabelDrag(event, pointId) {
+    const drag = dragRef.current;
+    if (drag.pointId !== pointId) return;
+    const dx = drag.originDx + (event.clientX - drag.startX);
+    const dy = drag.originDy + (event.clientY - drag.startY);
+    dragRef.current.moved = true;
+    setPoints((prev) => prev.map((p) => (p.id === pointId ? { ...p, labelDx: Math.round(dx), labelDy: Math.round(dy), labelMoved: true } : p)));
+  }
+
+  function endLabelDrag() {
+    const wasMoved = dragRef.current.moved;
+    dragRef.current = { pointId: null, startX: 0, startY: 0, originDx: 0, originDy: 0, moved: false };
+    setDraggingLabelId(null);
+    return wasMoved;
+  }
+
+  function removePointById(pointId) {
+    if (isRecordSaved) return;
+    setPoints((prev) => prev.filter((p) => p.id !== pointId));
+    if (editingPointId === pointId) {
+      setEditingPointId(null);
+      setDraftHeight("");
+    }
+    if (basePointId === pointId) setBasePointId(null);
+    if (pendingBaseId === pointId) setPendingBaseId(null);
+    setSelectedTwistIds((prev) => prev.filter((p) => p !== pointId));
+    setTwistResult(null);
+  }
+
+  function pointClick(pointId) {
+    if (isRecordSaved) {
+      const p = points.find((item) => item.id === pointId);
+      setEditingPointId(pointId);
+      setDraftHeight(p && p.height !== null ? p.height : "");
+      return;
+    }
+    if (mode === "point" && overlayMode === "point" && !pointInputLocked) {
+      removePointById(pointId);
+      return;
+    }
+
+    if (mode === "baseSelect") {
+      setPendingBaseId(pointId);
+      setEditingPointId(null);
+      return;
+    }
+    if (mode === "twistSelect") {
+      setSelectedTwistIds((prev) => {
+        if (prev.includes(pointId)) return prev.filter((id) => id !== pointId);
+        if (prev.length >= 4) return [prev[1], prev[2], prev[3], pointId];
+        return [...prev, pointId];
+      });
+      return;
+    }
+    const p = points.find((item) => item.id === pointId);
+    setEditingPointId(pointId);
+    setDraftHeight(p && p.height !== null ? p.height : "");
+  }
+
+  function saveHeight() {
+    if (isRecordSaved) return;
+    if (!editingPointId) return;
+    const value = numOrNull(draftHeight);
+    setPoints((prev) => prev.map((p) => (p.id === editingPointId ? { ...p, height: value } : p)));
+    setEditingPointId(null);
+    setDraftHeight("");
+    setTwistResult(null);
+  }
+
+  function updatePointField(pointId, field, value) {
+    if (isRecordSaved) return;
+    const n = numOrNull(value);
+    setPoints((prev) => prev.map((p) => (p.id === pointId ? { ...p, [field]: n } : p)));
+    if (field === "thickness" && calcSettings.thicknessMode === "variable") {
+      setCalcSettings((prev) => ({ ...prev, defaultThickness: n }));
+    }
+    setTwistResult(null);
+  }
+
+  function deletePoint() {
+    if (isRecordSaved) return;
+    if (!editingPointId) return;
+    removePointById(editingPointId);
+  }
+
+  function startBaseSelect() {
+    if (isRecordSaved) return;
+    if (points.length === 0) {
+      alert("測定点がありません。図面上をタップして測定点を追加してください。");
+      return;
+    }
+    setMode("baseSelect");
+    setPendingBaseId(null);
+    setSelectedTwistIds([]);
+    setEditingPointId(null);
+    setTwistResult(null);
+  }
+
+  function confirmBasePoint() {
+    if (isRecordSaved) return;
+    if (!pendingBaseId) return;
+    setBasePointId(pendingBaseId);
+    setPendingBaseId(null);
+    setMode("point");
+    setSelectedTwistIds([]);
+    setTwistResult(null);
+  }
+
+  function cancelBaseSelect() {
+    setPendingBaseId(null);
+    setMode("point");
+  }
+
+  function startTwistSelect() {
+    if (isRecordSaved) return;
+    if (!basePointId) {
+      alert("先に基準点を設定してください。");
+      return;
+    }
+    setMode("twistSelect");
+    setSelectedTwistIds([]);
+    setEditingPointId(null);
+    setPendingBaseId(null);
+    setTwistResult(null);
+  }
+
+  function calculateTwist() {
+    if (isRecordSaved) return;
+    if (selectedTwistIds.length !== 4) {
+      alert("4つの測定点を選択してください。");
+      return;
+    }
+    const selected = selectedTwistIds.map((id) => pointsWithDiff.find((p) => p.id === id)).filter(Boolean);
+    const result = calculateTwistFromSelected(selected);
+    if (!result) {
+      alert("選択した4点の高低差が計算できません。基準点・測定値・板厚・キャンバー修正数値を確認してください。");
+      return;
+    }
+    setTwistResult({
+      ids: selectedTwistIds,
+      diagA: result.diagA,
+      diagB: result.diagB,
+      twist: result.twist,
+      ok: result.twist <= threshold,
+      diagAFormula: result.diagAFormula,
+      diagBFormula: result.diagBFormula
+    });
+    setMode("point");
+  }
+
+  function saveRecord() {
+    setIsRecordSaved(true);
+    setEditingPointId(null);
+    setDraftHeight("");
+    setMode("point");
+    setPendingBaseId(null);
+    setSelectedTwistIds([]);
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+    setIsListening(false);
+  }
+
+  function startVoiceInput() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("このブラウザでは音声入力に対応していません。Chromeなどの対応ブラウザで試してください。");
+      return;
+    }
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = "ja-JP";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.onstart = () => setIsListening(true);
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+    recognition.onresult = (event) => {
+      let finalText = "";
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        if (event.results[i].isFinal) finalText += event.results[i][0].transcript;
+      }
+      if (finalText) {
+        setFreeComment((prev) => `${prev}${prev ? "\n" : ""}${finalText}`);
+      }
+    };
+    recognitionRef.current = recognition;
+    recognition.start();
+  }
+
+  function exportReport() {
+    const br = String.fromCharCode(10);
+    const lines = [];
+    lines.push("船体ブロック 精度検査記録");
+    lines.push("==============================");
+    lines.push(`測定日: ${inspectionInfo.measurementDate}`);
+    lines.push(`計測者: ${displayInspectors.join(", ") || "未設定"}`);
+    lines.push(`SNo: ${inspectionInfo.sno || "未入力"}`);
+    lines.push(`船種: ${displayShipType || "未設定"}`);
+    lines.push(`製造者/業者名: ${displayVendor || "未設定"}`);
+    lines.push(`ブロック名: ${inspectionInfo.blockName || "未設定"}`);
+    lines.push(`管理番号: ${blockCode}`);
+    lines.push(`計算条件: ${calculationPatternLabel(calcSettings)}`);
+    lines.push(`作成日時: ${new Date().toLocaleString("ja-JP")}`);
+    lines.push(`基準点: ${basePoint ? basePoint.id : "未設定"}`);
+    lines.push(`ねじれ許容値: ${threshold} mm`);
+    lines.push(`保存状態: ${isRecordSaved ? "保存済み" : "未保存"}`);
+    lines.push("");
+    lines.push("TTop / Bottom記録");
+    lines.push("------------------------------");
+    if (topBottomMarks.length) {
+      topBottomMarks.forEach((m) => lines.push(`${m.id} TTop: ${m.topText || "—"} / Bottom: ${m.bottomText || "—"}`));
+    } else {
+      lines.push("未入力");
+    }
+    lines.push("");
+    lines.push("測定点一覧");
+    lines.push("------------------------------");
+    pointsWithDiff.forEach((p) => lines.push(`${p.id} 実測 ${p.height ?? "—"} mm 板厚 ${p.thickness ?? "—"} mm キャンバー ${p.camber ?? 0} mm 計算後高低差 ${signedMm(p.diff)}`));
+    lines.push("");
+    lines.push("ねじれ判定");
+    lines.push("------------------------------");
+    if (twistResult) {
+      lines.push(`選択4点: ${twistResult.ids.join(", ")}`);
+      lines.push(`対角A: ${twistResult.diagAFormula} = ${twistResult.diagA} mm`);
+      lines.push(`対角B: ${twistResult.diagBFormula} = ${twistResult.diagB} mm`);
+      lines.push(`ねじれ量: ${twistResult.twist} mm`);
+      lines.push(`判定: ${twistResult.ok ? "OK" : "要精査"}`);
+    } else {
+      lines.push("未計算");
+    }
+    lines.push("");
+    lines.push("フリーコメント");
+    lines.push("------------------------------");
+    lines.push(freeComment || "未入力");
+    downloadText(`${safeFileName(blockCode)}_inspection_report.txt`, lines.join(br));
+  }
+
+  if (screen === "home") {
+    return (
+      <div className="app">
+        <style>{css}</style>
+        <div className="card centerCard">
+          <h1 className="title">船体ブロック精度測定アプリ</h1>
+          <p className="subtitle">新しく測定を始めるか、途中まで作成したJSON保存データを読み込んで再編集します。</p>
+          <div className="formGrid">
+            <div className="formBlock">
+              <h2 className="sectionTitle">新規作成</h2>
+              <p className="muted">検査情報の入力から新しい測定記録を作成します。</p>
+              <button className="btn primary" style={{ width: "100%", marginTop: 12 }} onClick={startNewRecord}>新規作成を開始</button>
+            </div>
+            <div className="formBlock">
+              <h2 className="sectionTitle">再編集</h2>
+              <p className="muted">一時保存したJSONファイルを選択して、途中から作業を再開します。</p>
+              <button className="btn blue" style={{ width: "100%", marginTop: 12 }} onClick={() => setHomeMode(homeMode === "reedit" ? null : "reedit")}>再編集データを開く</button>
+            </div>
+          </div>
+          {homeMode === "reedit" ? (
+            <div className="smallBox" style={{ marginTop: 16 }}>
+              <label className="label">JSON保存データを選択</label>
+              <input className="input" type="file" accept="application/json,.json" onChange={importJsonSave} />
+              <div className="muted" style={{ marginTop: 8 }}>「一時保存」で出力したJSONファイルを選択してください。選択すると保存時点の画面を開きます。</div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "register") {
+    return (
+      <div className="app">
+        <style>{css}</style>
+        <div className="card centerCard">
+          <h1 className="title">検査情報入力</h1>
+          <p className="subtitle">測定日・計測者・SNo・船種・製造者情報・ブロック名を入力して、図面画像登録へ進みます。</p>
+
+          <div className="formGrid">
+            <div className="formBlock">
+              <label className="label">測定日</label>
+              <input className="input" type="date" value={inspectionInfo.measurementDate} onChange={(e) => updateInfo("measurementDate", e.target.value)} />
+            </div>
+
+            <div className="formBlock">
+              <label className="label">SNo（4桁）</label>
+              <input className="input" type="text" inputMode="numeric" value={inspectionInfo.sno || ""} onChange={(e) => updateInfo("sno", onlyDigits(e.target.value).slice(0, 4))} placeholder="例：0123" />
+            </div>
+
+            <div className="formBlock full">
+              <label className="label">計測者（最大3名）</label>
+              <div className="formGrid three">
+                {[0, 1, 2].map((index) => (
+                  <div key={index}>
+                    <select className="select" value={inspectionInfo.inspectors[index]} onChange={(e) => updateInspector(index, e.target.value)}>
+                      {inspectorOptions.map((name) => <option key={`${index}-${name || "blank"}`} value={name}>{name || `計測者${index + 1}を選択`}</option>)}
+                    </select>
+                    {inspectionInfo.inspectors[index] === "その他" ? <input className="input" style={{ marginTop: 10 }} value={inspectionInfo.inspectorOthers[index]} onChange={(e) => updateInspectorOther(index, e.target.value)} placeholder={`計測者${index + 1}を手入力`} /> : null}
+                  </div>
+                ))}
+              </div>
+              <div className="btnRow" style={{ marginTop: 10 }}>
+                <button type="button" className="btn" onClick={() => openListEditor("inspector")}>＋ 計測者を追加</button>
+                <button type="button" className="btn red" onClick={() => openDeleteEditor("inspector")}>− 計測者を削除</button>
+              </div>
+              {listEditor.type === "inspector" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">追加する計測者名</label>
+                  <input className="input" value={listEditor.value} onChange={(e) => setListEditor({ type: "inspector", value: e.target.value })} placeholder="例：山田" />
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn primary" onClick={addDropdownOption}>追加</button>
+                    <button type="button" className="btn" onClick={cancelListEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+              {deleteEditor.type === "inspector" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">削除する計測者名</label>
+                  <select className="select" value={deleteEditor.value} onChange={(e) => setDeleteEditor({ type: "inspector", value: e.target.value })}>
+                    <option value="">削除する計測者を選択</option>
+                    {removableOptions("inspector").map((name) => <option key={`delete-inspector-${name}`} value={name}>{name}</option>)}
+                  </select>
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn red" onClick={deleteDropdownOption}>削除</button>
+                    <button type="button" className="btn" onClick={cancelDeleteEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="formBlock">
+              <div className="btnRow" style={{ justifyContent: "space-between", marginBottom: 6 }}>
+                <label className="label" style={{ marginBottom: 0 }}>船種</label>
+                <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => openListEditor("shipType")}>＋追加</button>
+                <button type="button" className="btn red" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => openDeleteEditor("shipType")}>−削除</button>
+              </div>
+              <select className="select" value={inspectionInfo.shipType} onChange={(e) => updateInfo("shipType", e.target.value)}>
+                {shipTypeOptions.map((type) => <option key={type || "blank-ship"} value={type}>{type || "船種を選択"}</option>)}
+              </select>
+              {inspectionInfo.shipType === "その他" ? <input className="input" style={{ marginTop: 10 }} value={inspectionInfo.shipTypeOther} onChange={(e) => updateInfo("shipTypeOther", e.target.value)} placeholder="船種を手入力" /> : null}
+              {listEditor.type === "shipType" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">追加する船種</label>
+                  <input className="input" value={listEditor.value} onChange={(e) => setListEditor({ type: "shipType", value: e.target.value })} placeholder="例：新しい船種" />
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn primary" onClick={addDropdownOption}>追加</button>
+                    <button type="button" className="btn" onClick={cancelListEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+              {deleteEditor.type === "shipType" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">削除する船種</label>
+                  <select className="select" value={deleteEditor.value} onChange={(e) => setDeleteEditor({ type: "shipType", value: e.target.value })}>
+                    <option value="">削除する船種を選択</option>
+                    {removableOptions("shipType").map((name) => <option key={`delete-ship-${name}`} value={name}>{name}</option>)}
+                  </select>
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn red" onClick={deleteDropdownOption}>削除</button>
+                    <button type="button" className="btn" onClick={cancelDeleteEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="formBlock">
+              <div className="btnRow" style={{ justifyContent: "space-between", marginBottom: 6 }}>
+                <label className="label" style={{ marginBottom: 0 }}>製造者 / 業者名</label>
+                <button type="button" className="btn" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => openListEditor("vendor")}>＋追加</button>
+                <button type="button" className="btn red" style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => openDeleteEditor("vendor")}>−削除</button>
+              </div>
+              <select className="select" value={inspectionInfo.vendor} onChange={(e) => { updateInfo("vendor", e.target.value); if (e.target.value !== "その他") updateInfo("vendorOther", ""); }}>
+                {vendorOptions.map((name) => <option key={name || "blank-vendor"} value={name}>{name || "業者名を選択"}</option>)}
+              </select>
+              {inspectionInfo.vendor === "その他" ? <input className="input" style={{ marginTop: 10 }} value={inspectionInfo.vendorOther} onChange={(e) => updateInfo("vendorOther", e.target.value)} placeholder="業者名を手入力" /> : null}
+              {listEditor.type === "vendor" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">追加する業者名</label>
+                  <input className="input" value={listEditor.value} onChange={(e) => setListEditor({ type: "vendor", value: e.target.value })} placeholder="例：新しい業者名" />
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn primary" onClick={addDropdownOption}>追加</button>
+                    <button type="button" className="btn" onClick={cancelListEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+              {deleteEditor.type === "vendor" ? (
+                <div className="smallBox" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="label">削除する業者名</label>
+                  <select className="select" value={deleteEditor.value} onChange={(e) => setDeleteEditor({ type: "vendor", value: e.target.value })}>
+                    <option value="">削除する業者名を選択</option>
+                    {removableOptions("vendor").map((name) => <option key={`delete-vendor-${name}`} value={name}>{name}</option>)}
+                  </select>
+                  <div className="btnRow" style={{ marginTop: 10 }}>
+                    <button type="button" className="btn red" onClick={deleteDropdownOption}>削除</button>
+                    <button type="button" className="btn" onClick={cancelDeleteEditor}>キャンセル</button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="formBlock full">
+              <label className="label">ブロック名</label>
+              <input className="input" value={inspectionInfo.blockName} onChange={(e) => updateInfo("blockName", e.target.value)} placeholder="例：上甲板ブロック / B-102 など" />
+            </div>
+          </div>
+
+          <div className="smallBox" style={{ marginTop: 16 }}>
+            <div className="label">管理番号プレビュー</div>
+            <div style={{ fontWeight: 900 }}>{blockCode}</div>
+            <div className="muted" style={{ marginTop: 6 }}>SNoは4桁推奨です。未入力の項目があっても次の画面へ進めます。</div>
+          </div>
+
+          <div className="registerActionBox">
+            <button className="btn bigNext" onClick={registerInspectionInfo}>決定して次へ</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "upload") {
+    return (
+      <div className="app">
+        <style>{css}</style>
+        <div className="card centerCard">
+          <div className="pageBackBar"><button className="btn backBtn" onClick={goBackOnePage}>← 1個前に戻る</button></div>
+          <h1 className="title">図面画像登録</h1>
+          <p className="subtitle">管理番号: <b>{blockCode}</b><br />測定日: {inspectionInfo.measurementDate} / 計測者: {displayInspectors.join("、") || "未設定"}</p>
+          {!drawingImage ? (
+            <div className="fileBox">
+              <div style={{ fontWeight: 900, marginBottom: 6 }}>図面画像を登録してください</div>
+              <div className="muted">保存済みの画像ファイルを選択するか、カメラを起動して撮影できます。</div>
+              <div className="btnRow" style={{ justifyContent: "center", marginTop: 14 }}>
+                <label className="btn primary">画像を選択して登録<input style={{ display: "none" }} type="file" accept="image/*" onChange={uploadDrawing} /></label>
+                <button className="btn blue" onClick={startCamera}>カメラを起動して撮影</button>
+              </div>
+              {cameraError ? <div className="empty" style={{ marginTop: 12 }}>{cameraError}</div> : null}
+              {cameraStream ? (
+                <div className="cameraBox">
+                  <video id="camera-preview-video" className="cameraVideo" ref={attachCamera} autoPlay playsInline muted />
+                  <div className="btnRow" style={{ justifyContent: "center", marginTop: 12 }}>
+                    <button className="btn primary" onClick={captureCameraImage}>この写真を図面画像として登録</button>
+                    <button className="btn" onClick={stopCamera}>カメラを閉じる</button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {drawingImage ? <div><div className="success" style={{ marginTop: 16 }}>図面画像を登録しました。次に計算条件を設定します。</div><img className="previewImg" src={drawingImage} alt="図面プレビュー" /><div className="btnRow" style={{ marginTop: 12 }}><button className="btn red" onClick={() => setDrawingImage(null)}>画像を登録し直す</button></div></div> : null}
+          <div className="btnRow" style={{ marginTop: 16 }}>
+            <button className="btn" onClick={() => { stopCamera(); setScreen("register"); }}>戻る</button>
+          </div>
+          <div className="registerActionBox">
+            <button className="btn bigNext" onClick={goInspect} disabled={!drawingImage}>決定して次へ</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "calcSettings") {
+    return (
+      <div className="app">
+        <style>{css}</style>
+        <div className="card centerCard">
+          <div className="pageBackBar"><button className="btn backBtn" onClick={goBackOnePage}>← 1個前に戻る</button></div>
+          <h1 className="title">計算条件設定</h1>
+          <p className="subtitle">今回の測定条件を選択してください。この設定に応じて、高低差とねじれ計算の式を切り替えます。</p>
+
+          <div className="formGrid">
+            <div className="formBlock full">
+              <label className="label">レベル計測機の位置</label>
+              <div className="choiceGroup">
+                <button type="button" className={calcSettings.instrumentPosition === "below" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("instrumentPosition", "below")}>
+                  ブロック下からの計測
+                  <span className="choiceSub">計測機をブロックの下にセット</span>
+                </button>
+                <button type="button" className={calcSettings.instrumentPosition === "above" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("instrumentPosition", "above")}>
+                  ブロック上からの計測
+                  <span className="choiceSub">計測機をブロックの上にセット</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="formBlock full">
+              <label className="label">基準線</label>
+              <div className="choiceGroup">
+                <button type="button" className={calcSettings.referenceSurface === "upper" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("referenceSurface", "upper")}>
+                  鉄板の上面を基準
+                  <span className="choiceSub">上面を基準線として計算</span>
+                </button>
+                <button type="button" className={calcSettings.referenceSurface === "lower" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("referenceSurface", "lower")}>
+                  鉄板の下面を基準
+                  <span className="choiceSub">下面を基準線として計算</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="formBlock full">
+              <label className="label">板厚条件</label>
+              <div className="choiceGroup">
+                <button type="button" className={calcSettings.thicknessMode === "same" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("thicknessMode", "same")}>
+                  板厚が同じ
+                  <span className="choiceSub">全測定点の板厚が同じ場合</span>
+                </button>
+                <button type="button" className={calcSettings.thicknessMode === "variable" ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("thicknessMode", "variable")}>
+                  板厚がバラバラ
+                  <span className="choiceSub">測定点ごとに板厚を入力</span>
+                </button>
+              </div>
+            </div>
+
+            {calcSettings.thicknessMode === "variable" ? (
+              <div className="formBlock full">
+                <label className="label">初期板厚 mm</label>
+                <input className="input" type="number" value={calcSettings.defaultThickness ?? ""} onChange={(e) => updateDefaultThickness(e.target.value)} placeholder="例：10" />
+                <div className="muted" style={{ marginTop: 8 }}>
+                  ここで入力した板厚が、新しく追加する測定点に自動で入ります。測定画面で板厚を変更すると、その変更後の板厚が次の測定点に引き継がれます。
+                </div>
+              </div>
+            ) : null}
+
+            <div className="formBlock full">
+              <label className="label">キャンバー修正</label>
+              <div className="choiceGroup">
+                <button type="button" className={!calcSettings.useCamber ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("useCamber", false)}>
+                  キャンバー修正なし
+                  <span className="choiceSub">補正値を使わない</span>
+                </button>
+                <button type="button" className={calcSettings.useCamber ? "choiceBtn active" : "choiceBtn"} onClick={() => updateCalcSetting("useCamber", true)}>
+                  キャンバー修正あり
+                  <span className="choiceSub">各点の補正値を計算に反映</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="smallBox" style={{ marginTop: 16 }}>
+            <div className="label">選択中の計算条件</div>
+            <div style={{ fontWeight: 900 }}>{calculationPatternLabel(calcSettings)}</div>
+            <div className="muted" style={{ marginTop: 8 }}>板厚が違う設定を選んだ場合は、初期板厚を入力できます。測定画面で板厚を変更すると、その値が次に追加する測定点へ引き継がれます。キャンバー修正ありの場合は、各測定点のキャンバー修正数値も入力できます。</div>
+          </div>
+
+          <div className="btnRow" style={{ marginTop: 16 }}>
+            <button className="btn" onClick={() => setScreen("upload")}>戻る</button>
+            <button className="btn primary" onClick={proceedToInspect}>この条件で測定画面へ進む</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <style>{css}</style>
+      <div className="shell">
+        <div className="pageBackBar"><button className="btn backBtn" onClick={goBackOnePage}>← 1個前に戻る</button></div>
+        <div className="mainGrid">
+          <div className="card">
+            <div className="drawingHeader">
+              <div>
+                <h2 className="sectionTitle">図面測定</h2>
+                <p className="infoText">管理番号: <b>{blockCode}</b><br />測定日: {inspectionInfo.measurementDate} / 船種: {displayShipType || "未設定"} / SNo: {inspectionInfo.sno || "未入力"}<br />計算条件: {calculationPatternLabel(calcSettings)}<br />状態: <b>{isRecordSaved ? "保存済み（編集ロック中）" : "編集中"}</b></p>
+              </div>
+              <div className="btnRow">
+                <button className={stepClass("topBottom")} onClick={() => { setMode("topBottom"); setPendingBaseId(null); setSelectedTwistIds([]); }} disabled={isRecordSaved}>TTop/Bottom入力</button>
+                <button className={stepClass("pointInput")} onClick={() => { setMode("point"); setPendingBaseId(null); setSelectedTwistIds([]); }} disabled={isRecordSaved}>測定点入力</button>
+                <button className={stepClass("pointFinish")} onClick={() => setPointInputLocked(true)} disabled={pointInputLocked || isRecordSaved}>測定点入力終了</button>
+                <button className={stepClass("baseSelect")} onClick={startBaseSelect} disabled={isRecordSaved}>基準点を設定</button>
+                <button className={stepClass("twistSelect")} onClick={startTwistSelect} disabled={!basePointId || isRecordSaved}>4点指定</button>
+                <button className="btn" onClick={exportJsonSave}>一時保存</button>
+                <button className={isRecordSaved ? "btn stepDone" : "btn stepWaiting"} onClick={exportPdfReport}>PDF出力</button>
+                <button className={isRecordSaved ? "btn stepDone" : "btn stepWaiting"} onClick={exportCsvForDatabase}>CSV出力</button>
+                <button className={isRecordSaved ? "btn stepDone" : "btn stepWaiting"} onClick={exportJsonForDatabase}>JSON出力</button>
+                <button className={isRecordSaved ? "btn stepDone" : "btn stepWaiting"} onClick={exportImageReport}>画像出力</button>
+                <button className="btn red" onClick={resetAll}>最初から</button>
+                <div className="overlaySwitch">
+                  <span className="overlaySwitchLabel">表示切替</span>
+                  <button type="button" className={overlayMode === "point" ? "btn primary" : "btn"} onClick={() => setOverlayMode("point")}>ポイント表示</button>
+                  <button type="button" className={overlayMode === "label" ? "btn primary" : "btn"} onClick={() => setOverlayMode("label")}>数字表示</button>
+                </div>
+              </div>
+            </div>
+
+            <div className="canvasWrap" onClick={canvasClick}>
+              <img className="canvasImage" src={drawingImage} alt="図面" />
+              <div className="canvasHint">
+                {isRecordSaved && "保存済みです。測定値などの編集はロックされています。"}
+                {!isRecordSaved && mode === "topBottom" && `図面をタップして、TTop / Bottomの入力枠を追加（${topBottomMarks.length}/2）`}
+                {!isRecordSaved && mode === "point" && !pointInputLocked && "図面をタップして測定点を追加 / 赤丸をもう一度タップで削除"}
+                {!isRecordSaved && mode === "point" && pointInputLocked && "測定点入力は終了しています。新しい点は追加されません。"}
+                {!isRecordSaved && mode === "baseSelect" && "基準点にしたい測定点をタップ"}
+                {!isRecordSaved && mode === "twistSelect" && "ねじれ計算に使う4点をタップ"}
+              </div>
+              {topBottomMarks.map((mark) => (
+                <div
+                  key={mark.id}
+                  className={`topBottomCard ${draggingTopBottomId === mark.id ? "dragging" : ""}`}
+                  style={{ left: `${mark.x}%`, top: `${mark.y}%` }}
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => { e.stopPropagation(); startTopBottomDrag(e, mark.id); }}
+                  onPointerMove={(e) => { e.stopPropagation(); moveTopBottomDrag(e, mark.id); }}
+                  onPointerUp={(e) => { e.stopPropagation(); endTopBottomDrag(); }}
+                  onPointerCancel={(e) => { e.stopPropagation(); endTopBottomDrag(); }}
+                  onDoubleClick={(e) => { e.stopPropagation(); deleteTopBottomMark(mark.id); }}
+                >
+                  <div className="topBottomRow">
+                    <div className="topBottomLabel">TTop</div>
+                    <input className="topBottomInput" value={mark.topText} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} onChange={(e) => updateTopBottomMark(mark.id, "topText", e.target.value)} placeholder="数値・文字" disabled={isRecordSaved} />
+                  </div>
+                  <div className="topBottomRow">
+                    <div className="topBottomLabel">Bottom</div>
+                    <input className="topBottomInput" value={mark.bottomText} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} onChange={(e) => updateTopBottomMark(mark.id, "bottomText", e.target.value)} placeholder="数値・文字" disabled={isRecordSaved} />
+                  </div>
+                </div>
+              ))}
+              {pointsWithDiff.map((p, index) => {
+                const pinClasses = ["pointPin"];
+                if (p.id === editingPointId) pinClasses.push("editing");
+                if (p.id === basePointId) pinClasses.push("base");
+                if (p.id === pendingBaseId) pinClasses.push("pendingBase");
+                if (selectedTwistIds.includes(p.id)) pinClasses.push("twist");
+                const autoOffset = autoLabelOffset(index);
+                const labelDx = p.labelMoved ? (p.labelDx ?? autoOffset.dx) : autoOffset.dx;
+                const labelDy = p.labelMoved ? (p.labelDy ?? autoOffset.dy) : autoOffset.dy;
+
+                return (
+                  <React.Fragment key={p.id}>
+                    <button className={pinClasses.join(" ")} style={{ left: `${p.x}%`, top: `${p.y}%` }} onClick={(e) => { e.stopPropagation(); pointClick(p.id); }} title={p.id}>{pointNumber(p.id)}</button>
+                    {overlayMode === "label" ? (
+                      <div
+                        className={`pointLabelCard ${draggingLabelId === p.id ? "dragging" : ""}`}
+                        style={{ left: `calc(${p.x}% + ${labelDx}px)`, top: `calc(${p.y}% + ${labelDy}px)` }}
+                        onPointerDown={(e) => { e.stopPropagation(); startLabelDrag(e, p.id); }}
+                        onPointerMove={(e) => { e.stopPropagation(); moveLabelDrag(e, p.id); }}
+                        onPointerUp={(e) => { e.stopPropagation(); const wasMoved = endLabelDrag(); if (!wasMoved) pointClick(p.id); }}
+                        onPointerCancel={(e) => { e.stopPropagation(); endLabelDrag(); }}
+                      >
+                        <div className="pointLabelId">丸{pointNumber(p.id)}</div>
+                        <div className="pointLabelValue">{pointDisplayText(p)}</div>
+                      </div>
+                    ) : null}
+                  </React.Fragment>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="sideCol">
+            <div className="panel">
+              <h3 className="panelTitle">フリーコメント</h3>
+              <p className="muted" style={{ marginTop: 0 }}>施工時のポイント、ずれが生じた原因と思われること、申し送り事項などを記録できます。</p>
+              <textarea className="textarea" value={freeComment} onChange={(e) => setFreeComment(e.target.value)} placeholder="例：右舷側の端部でズレが大きい。仮付け時の位置決め影響の可能性あり。" />
+              <div className="btnRow" style={{ marginTop: 10 }}>
+                <button className={isListening ? "btn blue" : "btn"} onClick={startVoiceInput}>{isListening ? "音声入力を停止" : "音声で入力"}</button>
+                <button className="btn" onClick={() => setFreeComment("")}>コメントを消去</button>
+              </div>
+              <div className="lockedText">音声入力はブラウザのマイク許可が必要です。</div>
+            </div>
+            <div className="panel">
+              <h3 className="panelTitle">測定点編集</h3>
+              {isRecordSaved ? <div className="savedBanner" style={{ marginBottom: 12 }}>保存済みです。測定値・板厚・キャンバー・測定点削除は編集できません。</div> : null}
+              {editingPoint ? (
+                <div className="smallBox">
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>選択中: {editingPoint.id}</div>
+                  <label className="label">測定値 mm</label>
+                  <input className="input" type="number" value={draftHeight} onChange={(e) => setDraftHeight(e.target.value)} placeholder="例：365" disabled={isRecordSaved} />
+                  {calcSettings.thicknessMode === "variable" ? (
+                    <>
+                      <label className="label" style={{ marginTop: 10 }}>板厚 mm</label>
+                      <input className="input" type="number" value={editingPoint.thickness ?? ""} onChange={(e) => updatePointField(editingPoint.id, "thickness", e.target.value)} placeholder="例：10" disabled={isRecordSaved} />
+                    </>
+                  ) : null}
+                  {calcSettings.useCamber ? (
+                    <>
+                      <label className="label" style={{ marginTop: 10 }}>キャンバー修正数値 mm</label>
+                      <input className="input" type="number" value={editingPoint.camber ?? ""} onChange={(e) => updatePointField(editingPoint.id, "camber", e.target.value)} placeholder="例：-100" disabled={isRecordSaved} />
+                    </>
+                  ) : null}
+                  <div className="btnRow" style={{ marginTop: 12 }}>
+                    <button className="btn primary" onClick={saveHeight} disabled={isRecordSaved}>保存</button>
+                    <button className="btn red" onClick={deletePoint} disabled={isRecordSaved}>この点を削除</button>
+                    <button className="btn" onClick={() => { setEditingPointId(null); setDraftHeight(""); }}>閉じる</button>
+                  </div>
+                </div>
+              ) : <div className="empty">図面上の測定点を選択すると、ここで測定値の入力や削除ができます。</div>}
+
+              <div className="measureList">
+                {pointsWithDiff.map((p) => {
+                  let diffClass = "";
+                  if (p.diff > 0) diffClass = "diffUp";
+                  if (p.diff < 0) diffClass = "diffDown";
+                  return (
+                    <div className="measureRow" key={p.id}>
+                      <button className="measureBadge" onClick={() => pointClick(p.id)}>{p.id}</button>
+                      <div style={{ display: "grid", gap: 6 }}>
+                        <input className="input" type="number" value={p.height ?? ""} placeholder="測定値" onChange={(e) => updatePointField(p.id, "height", e.target.value)} disabled={isRecordSaved} />
+                        {calcSettings.thicknessMode === "variable" ? <input className="input" type="number" value={p.thickness ?? ""} placeholder="板厚" onChange={(e) => updatePointField(p.id, "thickness", e.target.value)} disabled={isRecordSaved} /> : null}
+                        {calcSettings.useCamber ? <input className="input" type="number" value={p.camber ?? ""} placeholder="キャンバー" onChange={(e) => updatePointField(p.id, "camber", e.target.value)} disabled={isRecordSaved} /> : null}
+                      </div>
+                      <div className={`diffText ${diffClass}`}>{basePointId ? signedMm(p.diff) : p.height ?? "—"}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="panel">
+              <h3 className="panelTitle">基準点・ねじれ判定</h3>
+              {mode === "baseSelect" && pendingBasePoint ? (
+                <div className="confirmBox">
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>{pendingBasePoint.id} を基準点にしますか？</div>
+                  <div className="muted" style={{ marginBottom: 10 }}>測定値: {pendingBasePoint.height ?? "未入力"} mm</div>
+                  <div className="btnRow">
+                    <button className="btn green" onClick={confirmBasePoint}>はい、基準点にする</button>
+                    <button className="btn" onClick={() => setPendingBaseId(null)}>選び直す</button>
+                  </div>
+                </div>
+              ) : null}
+              {mode === "baseSelect" && !pendingBasePoint ? (
+                <div className="confirmBox">
+                  <b>基準点設定中です。</b><br />図面上または一覧の測定点をタップしてください。
+                  <div className="btnRow" style={{ marginTop: 10 }}><button className="btn" onClick={cancelBaseSelect}>基準点設定をやめる</button></div>
+                </div>
+              ) : null}
+
+              <div className="smallBox"><div className="label">現在の基準点</div><div style={{ fontWeight: 900 }}>{basePoint ? `${basePoint.id}（${basePoint.height ?? "未入力"} mm）` : "未設定"}</div></div>
+              <div className="smallBox"><div className="label">計算条件</div><div style={{ fontWeight: 900, lineHeight: 1.5 }}>{calculationPatternLabel(calcSettings)}</div><div className="btnRow" style={{ marginTop: 10 }}><button className="btn" onClick={() => setScreen("calcSettings")}>計算条件を変更</button></div></div>
+              <div className="smallBox"><label className="label">ねじれ許容値 mm</label><input className="input" type="number" value={threshold} onChange={(e) => setThreshold(Number(e.target.value) || 0)} disabled={isRecordSaved} /></div>
+              <div className="smallBox"><div className="label">選択4点</div><div style={{ fontWeight: 900 }}>{selectedTwistIds.length ? selectedTwistIds.join(" → ") : "未選択"}</div></div>
+
+              {mode === "twistSelect" ? (
+                <div className="btnRow" style={{ marginBottom: 12 }}>
+                  <button className="btn blue" onClick={calculateTwist} disabled={selectedTwistIds.length !== 4}>決定してねじれ計算</button>
+                  <button className="btn" onClick={() => { setMode("point"); setSelectedTwistIds([]); }}>4点指定をやめる</button>
+                </div>
+              ) : null}
+
+              {twistResult ? (
+                <div className={`resultBox ${twistResult.ok ? "ok" : "ng"}`}>
+                  <div style={{ fontWeight: 900 }}>ねじれ量</div>
+                  <div className="resultValue">{twistResult.twist} mm</div>
+                  <div style={{ fontSize: 13, lineHeight: 1.8 }}>
+                    <div>対角A: {twistResult.diagAFormula} = <b>{twistResult.diagA} mm</b></div>
+                    <div>対角B: {twistResult.diagBFormula} = <b>{twistResult.diagB} mm</b></div>
+                    <div style={{ marginTop: 8, fontWeight: 900 }}>判定: {twistResult.ok ? "OK / 納品可能" : "要精査 / 再確認"}</div>
+                  </div>
+                </div>
+              ) : <div className="empty">基準点を設定後、4点を指定してねじれ計算を行います。</div>}
+            </div>
+          </div>
+        </div>
+        <div className="registerActionBox">
+          <button className="btn bigNext" onClick={saveRecord} disabled={isRecordSaved}>{isRecordSaved ? "確定済み" : "確定"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
